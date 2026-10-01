@@ -216,6 +216,32 @@ var CONFIG = {
     shotSoundEvery: 2,        // 2回に1回だけ se_shot
     pendingSfxMs: 300,        // 音の準備前（resume待ち）に頼まれた効果音を、準備できたら鳴らし直す猶予（ミリ秒）
     firstBgmDelay: 0.12,      // 音の準備ができた直後のBGMは、この秒数だけ遅らせて始める（出だしの欠け対策）
+    sfxCutFade: 0.03,         // 画面が隠れたときに、鳴っている効果音の余韻を消すフェードの秒数（プチッと鳴らない長さ）
+    // 音量の配分（サウンド担当が実際のプレイを書き出して測って決めた値。QA 再レビュー 2026-10-01 19:40 合格時の値）
+    // 実際の音量 = seVolume × mix.sfx × sfx[id].level（効果音）、bgmVolume × mix.bgm（BGM）。そのあと安全用のリミッター → outputTrim
+    mix: {
+      sfx: 1.0,               // 効果音バス
+      bgm: 1.45,              // BGMバス（効果音とほぼ同じ大きさになるように）
+      duck: 0.4,              // 大事な音（被弾・星・WARNING）が鳴っている間の、細かい音（射撃・命中・爆発）の倍率（約 -8dB）
+      duckAttack: 0.01,       // 下げるまでの秒数
+      duckRelease: 0.15,      // 戻すまでの秒数
+      limitThreshold: -3,     // リミッターのしきい値（dB）。ふだんは効かない高さ
+      outputTrim: 0.92,       // リミッターのあとの倍率（True Peak を -1dBTP 以下に保つ）
+      maxSfxVoices: 24        // 効果音全体の同時発音数。超えたら se_shot / se_hit から間引く
+    },
+    // 効果音ごとの調整。level: 音量の倍率、gap: 同じ音の最短間隔（秒）、max: 同じ音の同時発音数、duck: 細かい音を下げておく秒数（大事な音だけ）
+    sfx: {
+      se_shot:         { level: 1, gap: 0.05, max: 3 },
+      se_hit:          { level: 1, gap: 0.06, max: 2 },
+      se_explode:      { level: 1, gap: 0.07, max: 3 },
+      se_star:         { level: 1, gap: 0.04, max: 3, duck: 0.35 },
+      se_damage:       { level: 1, gap: 0.15, max: 1, duck: 0.55 },
+      se_warning:      { level: 1, gap: 0.5,  max: 1, duck: 1.5 },
+      se_boss_explode: { level: 1, gap: 0.5,  max: 1 },
+      se_gameover:     { level: 1, gap: 0.5,  max: 1 },
+      se_clear:        { level: 1, gap: 0.5,  max: 1 },
+      se_select:       { level: 1, gap: 0.04, max: 2 }
+    },
     // 仮音（WebAudio ビープ）の定義。サウンド担当が audio.js を差し替えたら不要
     // type: 波形, freq: 開始Hz, freqEnd: 終了Hz, dur: 秒, gain: 相対音量
     beeps: {

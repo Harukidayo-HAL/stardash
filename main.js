@@ -87,7 +87,7 @@
   window.addEventListener('resize', resize);
   window.addEventListener('orientationchange', resize);
   document.addEventListener('visibilitychange', function () {
-    if (document.hidden) { Game.onHidden(); Input.releaseAll(); }
+    if (document.hidden) { Game.onHidden(); Input.releaseAll(); if (typeof Sound !== 'undefined' && Sound.stopSfx) Sound.stopSfx(); }   // 効果音の余韻も止める（QA 19:40）
   });
 
   Input.init(canvas, Game.onAction);

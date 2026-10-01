@@ -9,6 +9,7 @@
  * 任意（ゲーム側は存在チェックしてから呼ぶ。無くても動く）:
  *   Sound.unlock()       ユーザー入力（keydown / mousedown / touchstart / touchend）ごとに呼ばれる（自動再生制限の解除）。
  *                        iOS Safari は touchend でないと解除できないため、何度呼ばれても安全に作ること
+ *   Sound.stopSfx()      画面が隠れたときに呼ばれる。鳴っている効果音（余韻も）を止める
  *   Sound.setMuted(bool) ミュート反映（状態の保存はゲーム側が localStorage に行う）
  *
  * 音はすべて Web Audio API でその場で合成する（ネオン／シンセウェイブ調）。外部ファイル・サンプルは使わない。
@@ -19,7 +20,7 @@
  *   大事な効果音 ───────────────────────────────→ sfxBus(seVolume×mix.sfx) ─┐
  *   BGM → loopBus → bgmBus(bgmVolume×mix.bgm) ──────────────────────────────┤→ limiter → trim → master(ミュート) → destination
  *   リミッターはふだんは効かない安全用（実測: 通常プレイ・ボス戦とも 1dB 以上の圧縮は 0.1% 以下）。
- *   音量の配分は CONFIG.audio.mix（sfx, bgm, duck, limitThreshold, outputTrim）があればそれを使い、なければ下の既定値
+ *   音量の配分・間引きの数値の正本は config.js（CONFIG.audio.mix と CONFIG.audio.sfx）。audio.js の値は config に無いときの予備だけ
  *   （compressor などが作れない環境では、そのまま master へつなぐ）
  */
 var Sound = (function () {
@@ -41,14 +42,17 @@ var Sound = (function () {
   var voices = {};         // id -> 鳴っている音の終了時刻の配列（同時発音数の上限）
   var allVoices = [];      // 効果音全体の終了時刻
   var loop = null;         // 再生中のBGMの状態 { def, bus, send, nextTime }
+  var sfxOut = null;       // 効果音バスの出力先（リミッター、なければ master）
   var minorBus = null;     // 連打される細かい音（se_shot / se_hit / se_explode）。大事な音の間だけ下げる
   // 音量の配分（実測で決めた値。CONFIG.audio.mix があればそちらを使う）
   function mix(k, d) { var c = cfg(); return num(c && c.mix && c.mix[k], d); }
   var LOOKAHEAD = 0.14;    // 秒。BGM は少し先まで予約してタイマーの揺れに強くする
   var TICK_MS = 25;
-  var MAX_SFX_VOICES = 24;
   var MINOR_IDS = { se_shot: 1, se_hit: 1, se_explode: 1 };
-  var KEY_DUCK = { se_damage: 0.55, se_star: 0.35, se_warning: 1.5 };   // 大事な音: 細かい音を下げておく秒数
+  // 調整する数値の正本は config.js の CONFIG.audio.mix と CONFIG.audio.sfx。ここの値は config に無いときの予備だけ
+  var KEY_DUCK = { se_damage: 0.55, se_star: 0.35, se_warning: 1.5 };   // 予備: 大事な音が鳴る間、細かい音を下げておく秒数
+  function sfxCfg(id) { var c = cfg(); return (c && c.sfx && c.sfx[id]) || {}; }
+  var sfxLevel = 1;        // いま鳴らしている効果音の音量倍率（CONFIG.audio.sfx[id].level）。BGM では 1
 
   function cfg() { return (typeof CONFIG !== 'undefined' && CONFIG.audio) ? CONFIG.audio : null; }
   function num(v, d) { return (typeof v === 'number' && isFinite(v)) ? v : d; }
@@ -80,15 +84,40 @@ var Sound = (function () {
       lim.connect(trim); trim.connect(master);
       out = lim;
     } catch (e) { out = master; }
+    sfxOut = out;
+    makeSfxBuses();
+    try {
+      bgmBus = ctx.createGain(); bgmBus.gain.value = num(c && c.bgmVolume, 0.5) * mix('bgm', 1.45); bgmBus.connect(out);
+    } catch (e) { bgmBus = null; }
+  }
+
+  // 効果音のバス（sfxBus と minorBus）を作る。画面が隠れたときは古いバスごと消して作り直す
+  function makeSfxBuses() {
+    var c = cfg(), out = sfxOut || master;
     try {
       sfxBus = ctx.createGain(); sfxBus.gain.value = num(c && c.seVolume, 0.7) * mix('sfx', 1.0); sfxBus.connect(out);
     } catch (e) { sfxBus = null; }
     try {
       minorBus = ctx.createGain(); minorBus.gain.value = 1; minorBus.connect(sfxBus || out);
     } catch (e) { minorBus = null; }
+  }
+
+  // 鳴っている効果音の余韻をすぐ止める（画面が隠れたとき）。古いバスを短くフェードして切り離し、新しいバスに替える
+  function cutSfx() {
+    pendingSfx = null;
+    if (!ctx) return;
+    var old = sfxBus, oldMinor = minorBus, fade = num(cfg() && cfg().sfxCutFade, 0.03);
+    if (!old && !oldMinor) return;
     try {
-      bgmBus = ctx.createGain(); bgmBus.gain.value = num(c && c.bgmVolume, 0.5) * mix('bgm', 1.45); bgmBus.connect(out);
-    } catch (e) { bgmBus = null; }
+      var now = ctx.currentTime, g = (old || oldMinor).gain;
+      g.cancelScheduledValues(now); g.setValueAtTime(g.value, now); g.linearRampToValueAtTime(0, now + fade);
+    } catch (e) { /* 無視 */ }
+    setTimeout(function () {
+      try { if (oldMinor) oldMinor.disconnect(); } catch (e) { /* 無視 */ }
+      try { if (old) old.disconnect(); } catch (e) { /* 無視 */ }
+    }, fade * 1000 + 50);
+    lastPlay = {}; voices = {}; allVoices = [];   // 切った音の分の間引き・同時発音数を数えないようにする
+    makeSfxBuses();
   }
 
   function canSound() { return !!(ctx && unlocked && !muted && ctx.state === 'running'); }   // 解除前は予約しない（再開時にまとめて鳴るのを防ぐ）
@@ -112,14 +141,14 @@ var Sound = (function () {
   function voice(o) {
     var t = o.t, dur = o.dur, a = num(o.a, 0.004);
     var osc = ctx.createOscillator();
-    var g = ctx.createGain();
+    var g = ctx.createGain(); g.gain.value = 0;   // 最初の自動変化より前は無音（初期値1のままだと、書き出しで1サンプルのクリックが出た）
     osc.type = o.type || 'square';
     osc.frequency.setValueAtTime(o.f, t);
     if (o.f1 && o.f1 !== o.f) osc.frequency.exponentialRampToValueAtTime(o.f1, t + num(o.glide, dur));
     if (o.detune) { try { osc.detune.setValueAtTime(o.detune, t); } catch (e) { /* 無視 */ } }
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(o.gain, t + a);
-    if (o.hold) g.gain.setValueAtTime(o.gain, t + a + o.hold);
+    g.gain.linearRampToValueAtTime(o.gain * sfxLevel, t + a);
+    if (o.hold) g.gain.setValueAtTime(o.gain * sfxLevel, t + a + o.hold);
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     var node = osc;
     if (o.lp) {
@@ -142,9 +171,9 @@ var Sound = (function () {
     var t = o.t, dur = o.dur;
     var src = ctx.createBufferSource();
     src.buffer = buf; src.loop = true;
-    var g = ctx.createGain();
+    var g = ctx.createGain(); g.gain.value = 0;   // 同上（クリック対策）
     g.gain.setValueAtTime(0.0001, t);
-    g.gain.linearRampToValueAtTime(o.gain, t + num(o.a, 0.002));
+    g.gain.linearRampToValueAtTime(o.gain * sfxLevel, t + num(o.a, 0.002));
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     var node = src;
     try {
@@ -162,6 +191,7 @@ var Sound = (function () {
 
   // ---- 効果音の定義 ----
   // gap: 同じIDの最短間隔(秒)、max: 同じIDの同時発音数、len: おおよその長さ（発音数の管理用）
+  // gap と max は CONFIG.audio.sfx[id] にあればそちらを使う（ここの値は予備）。len は音の長さに合わせた内部の値
   var SFX = {
     // 射撃: とても短く静かな「ポッ」。三角波中心で高い倍音を抑え、2〜6kHz が耳に刺さらないように。毎回わずかに音程を揺らす
     se_shot: { gap: 0.05, max: 3, len: 0.06, fn: function (t, d) {
@@ -269,9 +299,9 @@ var Sound = (function () {
       var g = minorBus.gain, low = mix('duck', 0.4);
       g.cancelScheduledValues(now);
       g.setValueAtTime(g.value, now);
-      g.linearRampToValueAtTime(low, now + 0.01);
+      g.linearRampToValueAtTime(low, now + mix('duckAttack', 0.01));
       g.setValueAtTime(low, now + dur);
-      g.linearRampToValueAtTime(1, now + dur + 0.15);
+      g.linearRampToValueAtTime(1, now + dur + mix('duckRelease', 0.15));
     } catch (e) { /* 無視 */ }
   }
 
@@ -281,23 +311,26 @@ var Sound = (function () {
     if (!canSound()) {
       // 解除済みで準備（resume）待ちのときだけ、最後の1つを短い間だけ覚えておく。まとめて鳴らすことはしない
       // 射撃音・命中音は細かく何度も鳴るので覚えない（開始音などの大事な音を上書きしないため。QA 再レビュー 18:5x）
-      if (id === 'se_shot' || id === 'se_hit') return;
+      // 爆発音（se_explode）も同じく覚えない（QA 再レビュー 19:40。開始音を上書きできたため）
+      if (MINOR_IDS[id]) return;
       if (ctx && unlocked && !muted && ctx.state !== 'running' && ctx.state !== 'closed') pendingSfx = { id: id, at: nowMs() };
       return;
     }
-    var now = ctx.currentTime;
-    if (lastPlay[id] !== undefined && now - lastPlay[id] < def.gap && now >= lastPlay[id]) return;   // 連打の間引き
+    var now = ctx.currentTime, sc = sfxCfg(id);
+    var gap = num(sc.gap, def.gap), max = num(sc.max, def.max), duck = num(sc.duck, KEY_DUCK[id] || 0);
+    if (lastPlay[id] !== undefined && now - lastPlay[id] < gap && now >= lastPlay[id]) return;   // 連打の間引き
     var list = voices[id] || (voices[id] = []);
     while (list.length && list[0] <= now) list.shift();
     while (allVoices.length && allVoices[0] <= now) allVoices.shift();
-    if (list.length >= def.max) return;                                       // 同じ音の重なりすぎを防ぐ
-    if (allVoices.length >= MAX_SFX_VOICES && (id === 'se_shot' || id === 'se_hit')) return;   // 混んでいるときは細かい音から間引く
+    if (list.length >= max) return;                                       // 同じ音の重なりすぎを防ぐ
+    if (allVoices.length >= mix('maxSfxVoices', 24) && (id === 'se_shot' || id === 'se_hit')) return;   // 混んでいるときは細かい音から間引く
     lastPlay[id] = now;
     var end = now + def.len;
     list.push(end);
     allVoices.push(end); allVoices.sort(function (a, b) { return a - b; });
-    if (KEY_DUCK[id]) duckMinor(now, KEY_DUCK[id]);
-    def.fn(now + 0.005, (MINOR_IDS[id] && minorBus) || sfxBus || master);
+    if (duck > 0) duckMinor(now, duck);
+    sfxLevel = num(sc.level, 1);
+    try { def.fn(now + 0.005, (MINOR_IDS[id] && minorBus) || sfxBus || master); } finally { sfxLevel = 1; }
   }
 
   // ---- BGM の楽器 ----
@@ -489,6 +522,9 @@ var Sound = (function () {
     },
     stopBgm: function () {
       try { currentBgm = null; clearBgmLoop(); } catch (e) { /* 無視 */ }
+    },
+    stopSfx: function () {   // 任意: 画面が隠れたときに呼ばれる。鳴っている効果音の余韻を止める
+      try { cutSfx(); } catch (e) { /* 無視 */ }
     },
     _debugBgmLog: function () { return debugLog.slice(); },   // テスト用（読み取りのみ）
     setMuted: function (m) {
