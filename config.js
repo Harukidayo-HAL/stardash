@@ -186,6 +186,10 @@ var CONFIG = {
     hudFontSize: 16,
     lifeIconSize: 14,
     lifeIconGap: 6,
+    lifeIconFadeAlpha: 0.4,   // 自機がライフのアイコンに重なる（近づく）ときのアイコンの不透明度
+    lifeIconFadeMargin: 10,   // 自機の見た目（24×24）がアイコンの範囲からこのpx以内に来たら薄くする
+    lifeIconFadeExitMargin: 16, // 薄くなったあと、元に戻すのはこのpxより外に出たとき（境目でのチラつき防止。Margin 以上にする）
+    lifeIconFadeTime: 0.15,   // 薄くする／戻すのにかける秒数（0 ですぐ切り替え）
     bossBar: { x: 30, y: 52, w: 300, h: 6 },
     pauseOverlayAlpha: 0.6,
     resultOverlayAlpha: 0.6,
@@ -210,6 +214,8 @@ var CONFIG = {
     seVolume: 0.7,
     mutedKey: 'stardash_muted',
     shotSoundEvery: 2,        // 2回に1回だけ se_shot
+    pendingSfxMs: 300,        // 音の準備前（resume待ち）に頼まれた効果音を、準備できたら鳴らし直す猶予（ミリ秒）
+    firstBgmDelay: 0.12,      // 音の準備ができた直後のBGMは、この秒数だけ遅らせて始める（出だしの欠け対策）
     // 仮音（WebAudio ビープ）の定義。サウンド担当が audio.js を差し替えたら不要
     // type: 波形, freq: 開始Hz, freqEnd: 終了Hz, dur: 秒, gain: 相対音量
     beeps: {

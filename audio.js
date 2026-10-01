@@ -15,8 +15,11 @@
  * どんな環境でも例外を投げない。
  *
  * 信号の流れ:
- *   効果音 → sfxBus(seVolume) ─┐
- *   BGM    → loopBus → bgmBus(bgmVolume×BGM_MIX) ─┤→ limiter(DynamicsCompressor) → master(ミュート) → destination
+ *   細かい効果音(shot/hit/explode) → minorBus（被弾・星・WARNING の間だけ下げる）─┐
+ *   大事な効果音 ───────────────────────────────→ sfxBus(seVolume×mix.sfx) ─┐
+ *   BGM → loopBus → bgmBus(bgmVolume×mix.bgm) ──────────────────────────────┤→ limiter → trim → master(ミュート) → destination
+ *   リミッターはふだんは効かない安全用（実測: 通常プレイ・ボス戦とも 1dB 以上の圧縮は 0.1% 以下）。
+ *   音量の配分は CONFIG.audio.mix（sfx, bgm, duck, limitThreshold, outputTrim）があればそれを使い、なければ下の既定値
  *   （compressor などが作れない環境では、そのまま master へつなぐ）
  */
 var Sound = (function () {
@@ -27,6 +30,9 @@ var Sound = (function () {
   var currentBgm = null;   // 鳴らしたいBGM ID（unlock前でも覚えておく）
   var bgmTimer = null;
   var bgmStep = 0;
+  var pendingSfx = null;   // { id, at } 音の準備前に頼まれた効果音（1つだけ覚えておく）
+  var justResumed = false; // 準備ができた直後の最初のBGMの出だしを少し遅らせる
+  var debugLog = [];       // テスト用: 実際に予約したBGM（id）の記録
 
   // ---- 合成用の内部状態（サウンド担当） ----
   var sfxBus = null, bgmBus = null;
@@ -35,10 +41,14 @@ var Sound = (function () {
   var voices = {};         // id -> 鳴っている音の終了時刻の配列（同時発音数の上限）
   var allVoices = [];      // 効果音全体の終了時刻
   var loop = null;         // 再生中のBGMの状態 { def, bus, send, nextTime }
-  var BGM_MIX = 0.55;      // BGM は効果音より控えめに（CONFIG の bgmVolume にさらに掛ける）
+  var minorBus = null;     // 連打される細かい音（se_shot / se_hit / se_explode）。大事な音の間だけ下げる
+  // 音量の配分（実測で決めた値。CONFIG.audio.mix があればそちらを使う）
+  function mix(k, d) { var c = cfg(); return num(c && c.mix && c.mix[k], d); }
   var LOOKAHEAD = 0.14;    // 秒。BGM は少し先まで予約してタイマーの揺れに強くする
   var TICK_MS = 25;
   var MAX_SFX_VOICES = 24;
+  var MINOR_IDS = { se_shot: 1, se_hit: 1, se_explode: 1 };
+  var KEY_DUCK = { se_damage: 0.55, se_star: 0.35, se_warning: 1.5 };   // 大事な音: 細かい音を下げておく秒数
 
   function cfg() { return (typeof CONFIG !== 'undefined' && CONFIG.audio) ? CONFIG.audio : null; }
   function num(v, d) { return (typeof v === 'number' && isFinite(v)) ? v : d; }
@@ -62,18 +72,22 @@ var Sound = (function () {
     var c = cfg();
     var out = master;
     try {
+      // 安全用のリミッター。ふだんはかからず、ボス撃破などの大きな音が重なったときだけ効く高さにする
       var lim = ctx.createDynamicsCompressor();
-      lim.threshold.value = -10; lim.knee.value = 4; lim.ratio.value = 16;
-      lim.attack.value = 0.002; lim.release.value = 0.12;
-      var trim = ctx.createGain(); trim.gain.value = 1.1;   // compressor の自動メイクアップ分を戻してピークを -1dBFS 未満に
+      lim.threshold.value = mix('limitThreshold', -3); lim.knee.value = 0; lim.ratio.value = 20;
+      lim.attack.value = 0.001; lim.release.value = 0.1;
+      var trim = ctx.createGain(); trim.gain.value = mix('outputTrim', 0.92);   // compressor の自動メイクアップ分を戻して True Peak を -1dBTP 未満に
       lim.connect(trim); trim.connect(master);
       out = lim;
     } catch (e) { out = master; }
     try {
-      sfxBus = ctx.createGain(); sfxBus.gain.value = num(c && c.seVolume, 0.7); sfxBus.connect(out);
+      sfxBus = ctx.createGain(); sfxBus.gain.value = num(c && c.seVolume, 0.7) * mix('sfx', 1.0); sfxBus.connect(out);
     } catch (e) { sfxBus = null; }
     try {
-      bgmBus = ctx.createGain(); bgmBus.gain.value = num(c && c.bgmVolume, 0.5) * BGM_MIX; bgmBus.connect(out);
+      minorBus = ctx.createGain(); minorBus.gain.value = 1; minorBus.connect(sfxBus || out);
+    } catch (e) { minorBus = null; }
+    try {
+      bgmBus = ctx.createGain(); bgmBus.gain.value = num(c && c.bgmVolume, 0.5) * mix('bgm', 1.45); bgmBus.connect(out);
     } catch (e) { bgmBus = null; }
   }
 
@@ -149,45 +163,47 @@ var Sound = (function () {
   // ---- 効果音の定義 ----
   // gap: 同じIDの最短間隔(秒)、max: 同じIDの同時発音数、len: おおよその長さ（発音数の管理用）
   var SFX = {
-    // 射撃: とても短く静かな「ピッ」。毎回わずかに音程を揺らして耳が疲れないように
-    se_shot: { gap: 0.05, max: 3, len: 0.07, fn: function (t, d) {
+    // 射撃: とても短く静かな「ポッ」。三角波中心で高い倍音を抑え、2〜6kHz が耳に刺さらないように。毎回わずかに音程を揺らす
+    se_shot: { gap: 0.05, max: 3, len: 0.06, fn: function (t, d) {
       var p = rnd(0.97, 1.03);
-      voice({ type: 'square', f: 1560 * p, f1: 780 * p, t: t, dur: 0.06, gain: 0.125, a: 0.002, lp: 3800, lp1: 1500, dest: d });
-      voice({ type: 'triangle', f: 3120 * p, f1: 1900 * p, t: t, dur: 0.03, gain: 0.075, a: 0.001, dest: d });
+      voice({ type: 'triangle', f: 1250 * p, f1: 640 * p, t: t, dur: 0.05, gain: 0.14, a: 0.002, dest: d });
+      voice({ type: 'square', f: 1250 * p, f1: 640 * p, t: t, dur: 0.035, gain: 0.024, a: 0.002, lp: 1800, dest: d });
     } },
-    // 命中: 乾いた「チッ」
-    se_hit: { gap: 0.03, max: 3, len: 0.06, fn: function (t, d) {
-      noise({ t: t, dur: 0.04, gain: 0.352, ftype: 'highpass', f: 3500, dest: d });
-      voice({ type: 'square', f: 1020, f1: 520, t: t, dur: 0.05, gain: 0.096, lp: 2600, dest: d });
+    // 命中: 乾いた「チッ」。高域（6kHz〜）のノイズで、大事な音の帯域（1〜4kHz）をふさがない
+    se_hit: { gap: 0.06, max: 2, len: 0.05, fn: function (t, d) {
+      noise({ t: t, dur: 0.03, gain: 0.112, ftype: 'highpass', f: 6500, dest: d });
+      voice({ type: 'triangle', f: 900, f1: 500, t: t, dur: 0.04, gain: 0.064, dest: d });
     } },
-    // 敵撃破: ノイズの「ボシュッ」＋低いドスン
-    se_explode: { gap: 0.04, max: 4, len: 0.45, fn: function (t, d) {
-      noise({ t: t, dur: 0.42, gain: 0.504, ftype: 'lowpass', f: 5200, f1: 180, q: 1.2, dest: d });
-      voice({ type: 'sine', f: 190, f1: 42, t: t, dur: 0.3, gain: 0.6, a: 0.002, dest: d });
-      voice({ type: 'square', f: 300, f1: 60, t: t, dur: 0.12, gain: 0.084, lp: 1200, dest: d });
+    // 敵撃破: こもったノイズの「ボフッ」＋低いドスン（中高域は控えめ）
+    se_explode: { gap: 0.07, max: 3, len: 0.4, fn: function (t, d) {
+      noise({ t: t, dur: 0.36, gain: 0.16, ftype: 'lowpass', f: 1800, f1: 150, q: 1.0, dest: d });
+      voice({ type: 'sine', f: 180, f1: 42, t: t, dur: 0.28, gain: 0.32, a: 0.002, dest: d });
+      voice({ type: 'square', f: 260, f1: 60, t: t, dur: 0.1, gain: 0.025, lp: 700, dest: d });
     } },
-    // 星: キラッと上がる3音（E6→A6→E7）
-    se_star: { gap: 0.04, max: 3, len: 0.28, fn: function (t, d) {
+    // 星: キラッと上がる3音（E6→A6→E7）＋短い余韻。1〜4kHz にしっかり音がある
+    se_star: { gap: 0.04, max: 3, len: 0.36, fn: function (t, d) {
       var n = [88, 93, 100];
       for (var i = 0; i < 3; i++) {
-        voice({ type: 'triangle', f: mtof(n[i]), t: t + i * 0.045, dur: 0.16, gain: 0.224, a: 0.003, dest: d });
-        voice({ type: 'sine', f: mtof(n[i] + 12), t: t + i * 0.045, dur: 0.1, gain: 0.07, a: 0.003, dest: d });
+        var last = (i === 2);
+        voice({ type: 'triangle', f: mtof(n[i]), t: t + i * 0.05, dur: last ? 0.3 : 0.14, gain: 0.375, a: 0.003, dest: d });
+        voice({ type: 'square', f: mtof(n[i] - 12), t: t + i * 0.05, dur: last ? 0.22 : 0.1, gain: 0.05, a: 0.003, lp: 3500, dest: d });
       }
     } },
-    // 被弾: ザラついた下降音＋ノイズ。はっきり「やられた」とわかる
+    // 被弾: ザラついた下降音＋1〜4kHz の濁ったブザー＋ノイズ。爆発や命中が重なっていても「やられた」とわかる
     se_damage: { gap: 0.15, max: 1, len: 0.6, fn: function (t, d) {
-      voice({ type: 'sawtooth', f: 620, f1: 70, t: t, dur: 0.5, gain: 0.336, lp: 3200, lp1: 300, q: 4, dest: d });
-      voice({ type: 'square', f: 640, f1: 75, t: t, dur: 0.45, gain: 0.144, detune: 25, lp: 2400, lp1: 250, dest: d });
-      noise({ t: t, dur: 0.3, gain: 0.42, ftype: 'bandpass', f: 2400, f1: 400, q: 0.8, dest: d });
-      voice({ type: 'sine', f: 140, f1: 40, t: t, dur: 0.35, gain: 0.48, dest: d });
+      voice({ type: 'sawtooth', f: 620, f1: 90, t: t, dur: 0.5, gain: 0.24, lp: 3500, lp1: 900, q: 4, dest: d });
+      voice({ type: 'square', f: 1480, f1: 880, t: t, dur: 0.48, gain: 0.07, hold: 0.2, lp: 4000, dest: d });
+      voice({ type: 'square', f: 1520, f1: 905, t: t, dur: 0.48, gain: 0.07, hold: 0.2, lp: 4000, dest: d });
+      noise({ t: t, dur: 0.45, gain: 0.3, ftype: 'bandpass', f: 2600, f1: 1100, q: 0.9, dest: d });
+      voice({ type: 'sine', f: 140, f1: 40, t: t, dur: 0.35, gain: 0.3, dest: d });
     } },
     // WARNING: うねる警報音を3回
-    se_warning: { gap: 0.5, max: 1, len: 1.4, fn: function (t, d) {
+    se_warning: { gap: 0.5, max: 1, len: 1.5, fn: function (t, d) {
       for (var i = 0; i < 3; i++) {
-        var s = t + i * 0.45;
-        voice({ type: 'sawtooth', f: 520, f1: 820, glide: 0.3, t: s, dur: 0.4, gain: 0.16, a: 0.02, hold: 0.22, lp: 2600, q: 3, dest: d });
-        voice({ type: 'sawtooth', f: 523, f1: 826, glide: 0.3, t: s, dur: 0.4, gain: 0.12, a: 0.02, hold: 0.22, detune: -12, lp: 2000, dest: d });
-        voice({ type: 'square', f: 130, f1: 205, glide: 0.3, t: s, dur: 0.4, gain: 0.1, a: 0.02, hold: 0.22, lp: 800, dest: d });
+        var s = t + i * 0.5;
+        voice({ type: 'sawtooth', f: 520, f1: 820, glide: 0.3, t: s, dur: 0.4, gain: 0.2, a: 0.02, hold: 0.22, lp: 2600, q: 3, dest: d });
+        voice({ type: 'sawtooth', f: 523, f1: 826, glide: 0.3, t: s, dur: 0.4, gain: 0.15, a: 0.02, hold: 0.22, detune: -12, lp: 2000, dest: d });
+        voice({ type: 'square', f: 130, f1: 205, glide: 0.3, t: s, dur: 0.4, gain: 0.125, a: 0.02, hold: 0.22, lp: 800, dest: d });
       }
     } },
     // ボス撃破: 連続する爆発＋長い低音と余韻
@@ -235,9 +251,40 @@ var Sound = (function () {
     } }
   };
 
+  function pendingMs() { return (CONFIG.audio && CONFIG.audio.pendingSfxMs) || 300; }
+  function nowMs() { return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(); }
+  // 音の準備ができたら、直前に頼まれていた効果音（開始音など）を1回だけ鳴らし直す（QA v1.1 再レビュー）
+  function flushPending() {
+    try {
+      if (!ctx || ctx.state !== 'running') return;
+      var p = pendingSfx; pendingSfx = null;
+      if (p && nowMs() - p.at <= pendingMs()) playSfx(p.id);
+    } catch (e) { /* 無視 */ }
+  }
+
+  // 大事な音（被弾・星・WARNING）が鳴っている間、細かい音のバスを少し下げて聞き取りやすくする
+  function duckMinor(now, dur) {
+    if (!minorBus) return;
+    try {
+      var g = minorBus.gain, low = mix('duck', 0.4);
+      g.cancelScheduledValues(now);
+      g.setValueAtTime(g.value, now);
+      g.linearRampToValueAtTime(low, now + 0.01);
+      g.setValueAtTime(low, now + dur);
+      g.linearRampToValueAtTime(1, now + dur + 0.15);
+    } catch (e) { /* 無視 */ }
+  }
+
   function playSfx(id) {
     var def = SFX[id];
-    if (!def || !canSound()) return;
+    if (!def) return;
+    if (!canSound()) {
+      // 解除済みで準備（resume）待ちのときだけ、最後の1つを短い間だけ覚えておく。まとめて鳴らすことはしない
+      // 射撃音・命中音は細かく何度も鳴るので覚えない（開始音などの大事な音を上書きしないため。QA 再レビュー 18:5x）
+      if (id === 'se_shot' || id === 'se_hit') return;
+      if (ctx && unlocked && !muted && ctx.state !== 'running' && ctx.state !== 'closed') pendingSfx = { id: id, at: nowMs() };
+      return;
+    }
     var now = ctx.currentTime;
     if (lastPlay[id] !== undefined && now - lastPlay[id] < def.gap && now >= lastPlay[id]) return;   // 連打の間引き
     var list = voices[id] || (voices[id] = []);
@@ -249,7 +296,8 @@ var Sound = (function () {
     var end = now + def.len;
     list.push(end);
     allVoices.push(end); allVoices.sort(function (a, b) { return a - b; });
-    def.fn(now + 0.005, sfxBus || master);
+    if (KEY_DUCK[id]) duckMinor(now, KEY_DUCK[id]);
+    def.fn(now + 0.005, (MINOR_IDS[id] && minorBus) || sfxBus || master);
   }
 
   // ---- BGM の楽器 ----
@@ -374,7 +422,12 @@ var Sound = (function () {
       try {
         if (!loop || ctx.state !== 'running') { nextTime = -1; return; }   // 止まっている間は予約しない（再開時にまとめて鳴らさない）
         var now = ctx.currentTime;
-        if (nextTime < 0 || nextTime < now - 0.05) nextTime = now + 0.02;   // 初回・タイマーが大きく遅れたときは、まとめて鳴らさず今から
+        if (nextTime < 0 || nextTime < now - 0.05) {
+          var d0 = 0.02;
+          if (justResumed) { justResumed = false; d0 = Math.max(d0, (CONFIG.audio && CONFIG.audio.firstBgmDelay) || 0); }
+          nextTime = now + d0;
+          if (debugLog.length < 200) debugLog.push(currentBgm);
+        }   // 初回・タイマーが大きく遅れたときは、まとめて鳴らさず今から
         while (nextTime < now + LOOKAHEAD) {
           var total = def.bars * 16, st = bgmStep % 16, bar = Math.floor((bgmStep % total) / 16);
           if (!muted) def.fn(def, bar, st, nextTime, loop.bus, loop.send, sd);   // ミュート中は譜面だけ進める
@@ -400,8 +453,9 @@ var Sound = (function () {
         if (!ctx) return;
         // 'suspended'（自動再生制限）も 'interrupted'（iOS で通知・通話に割り込まれた）も resume する
         if (ctx.state !== 'running' && ctx.state !== 'closed' && ctx.resume) {
+          justResumed = true;
           var pr = ctx.resume();
-          if (pr && pr.catch) pr.catch(function () { /* 解除できなくても止めない */ });
+          if (pr && pr.then) pr.then(flushPending, function () { /* 解除できなくても止めない */ });
         }
         // iOS 向け: ユーザー操作の中で無音を1回鳴らすと確実に解除される
         try {
@@ -409,6 +463,10 @@ var Sound = (function () {
           var src = ctx.createBufferSource();
           src.buffer = buf; src.connect(ctx.destination); src.start(0);
         } catch (e2) { /* 無視 */ }
+        if (!ctx.__sdState) {
+          ctx.__sdState = true;
+          try { ctx.addEventListener('statechange', function () { if (ctx.state === 'running') flushPending(); }); } catch (e3) { /* 無視 */ }
+        }
         if (!unlocked) {
           unlocked = true;
           // 待っていたBGMは次のタスクで開始する。最初の入力でそのままゲーム開始した場合に
@@ -432,6 +490,7 @@ var Sound = (function () {
     stopBgm: function () {
       try { currentBgm = null; clearBgmLoop(); } catch (e) { /* 無視 */ }
     },
+    _debugBgmLog: function () { return debugLog.slice(); },   // テスト用（読み取りのみ）
     setMuted: function (m) {
       muted = !!m;
       try { if (master) master.gain.value = muted ? 0 : 1; } catch (e) { /* 無視 */ }

@@ -7,8 +7,8 @@
  *
  * v2 ネオン調（デザイナー / 2026-10-01、ディレクター承認済み。元ドラフト: assets/neon-draft/render-neon.js）
  * - ゲーム内の絵（背景・自機・弾・敵・ボス・星・エフェクト・バナー）はネオン版
- * - HUD / タイトル / ポーズ / リザルト（drawHUD, drawTitle, drawPause, drawGameOver, drawClear,
- *   drawTitleButtonShape など）は v1.1 のまま（読みやすさ優先で変更なし）
+ * - v3: HUD / タイトル / ポーズ / リザルト（drawHUD, drawTitle, drawPause, drawGameOver, drawClear,
+ *   drawTitleButtonShape）もネオン調に。位置・大きさ・判定は v1.1 と同じ。文字は fillText でくっきり
  * - 性能: shadowBlur は初回にオフスクリーン canvas へ焼き込むだけ。毎フレームは drawImage のみ
  */
 
@@ -403,74 +403,234 @@ function drawBanner(ctx, text, t, duration) {
   ctx.restore();
 }
 
-/* ===== HUD・タイトル・ポーズ・リザルト（v1.1 のまま） ===== */
+/* ===== HUD・タイトル・ポーズ・リザルト（v3 ネオン調） =====
+ * - 文字は毎回 fillText でくっきり描く（拡大してもにじまない。テストも fillText の文字列で確認している）
+ * - 光は「変わらない見出し・枠」だけ。枠の光とにじみは初回にオフスクリーン canvas へ焼き込んで drawImage。毎フレームの shadowBlur は無し
+ * - スコアのように毎フレーム変わる数字はグローなし。暗い縁取り（strokeText）だけで背景から浮かせる
+ * - 位置・大きさ・当たり判定（pauseButton, titleButton）は v1.1 と同じ値をそのまま使う
+ */
+var UI_NEON = {
+  overlay: '2,4,18',            // 覆いの色（RGB）。濃さは CONFIG.ui の pauseOverlayAlpha / resultOverlayAlpha
+  textOutline: 'rgba(0,0,0,0.75)',
+  lifeSize: 12,                 // ライフアイコンの見た目の大きさ（px）。自機 24px より小さく
+  lifeColor: '#8f8',            // 淡い緑（自機シアン・敵弾ピンク・星の金・自機弾の黄と別の色）
+  lifeOutline: 'rgba(0,0,0,0.85)',
+  hi: '#bfe6f0',
+  sub: '#c8d2dc',
+  dim: '#8a96a6',
+  cyan: '#4ff',
+  red: '#ff6b6b',
+  gold: '#ffd84a',
+  frame: 'rgba(120,230,255,0.8)',
+  bossFill: '#ffb020',          // ボスのコアと同じ琥珀色（敵弾ピンク #f8c と被らない）
+  bossFillHi: '#ffd27a',
+  bossFrame: 'rgba(255,51,170,0.75)'   // ボス本体と同じマゼンタ（CONFIG.boss.color #f3a）を細い外枠だけに
+};
+
+/* 文字の後ろに敷く光（だ円のにじみ）。文字の形は使わない：
+ * オフスクリーン canvas は lang を持たず 'monospace' が別のフォントに解決されることがあり、
+ * 文字の形のグローが本文とずれて二重に見えたため（v3 作業中に確認）。大きさは本番 ctx の measureText で決める */
+function _uiHazeSprite(w, size, color) {
+  var hw = Math.ceil(w / 2 + size * 0.6), hh = Math.ceil(size * 0.9);
+  return _neonSprite('uiHaze|' + hw + '|' + hh + '|' + color, hw * 2, hh * 2, 0, function (g, S) {
+    g.save();
+    g.scale(hw / hh, 1);
+    var rg = g.createRadialGradient(0, 0, 0, 0, 0, hh);
+    rg.addColorStop(0, _rgba(color, 0.22)); rg.addColorStop(0.6, _rgba(color, 0.08)); rg.addColorStop(1, _rgba(color, 0));
+    g.fillStyle = rg; g.beginPath(); g.arc(0, 0, hh, 0, Math.PI * 2); g.fill();
+    g.restore();
+  });
+}
+
+/* くっきり文字。glow なし: 暗い縁取りで背景から浮かせる（毎フレーム変わる数字向け）
+ * glow あり（固定の見出し）: キャッシュしたにじみ＋同じ色の太い半透明の縁（strokeText、shadowBlur なし）＋本文 */
+function _uiText(ctx, str, x, y, size, color, align, glow) {
+  align = align || 'center';
+  color = color || '#fff';
+  ctx.font = 'bold ' + size + 'px ' + CONFIG.ui.font;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.lineJoin = 'round';
+  if (glow) {
+    var wText = ctx.measureText(str).width;
+    var cx = align === 'left' ? x + wText / 2 : (align === 'right' ? x - wText / 2 : x);
+    _neonBlit(ctx, _uiHazeSprite(Math.round(wText), size, color), cx, y);
+    ctx.strokeStyle = _rgba(color, 0.25); ctx.lineWidth = Math.max(2.5, size * 0.12);
+    ctx.strokeText(str, x, y);
+  } else {
+    // 縁取りは文字の外側に線の太さの半分だけ出る。小さい画面でも外側が 1.5 デバイスpx 以上残るよう、
+    // 今の拡大率 k（論理px→デバイスpx）から最低の太さ 3/k を決める（360×640・DPR2 では k=2 なので従来どおり size×0.14）
+    var tf = ctx.getTransform ? ctx.getTransform() : null, k = tf ? Math.abs(tf.a) : 1;
+    ctx.strokeStyle = UI_NEON.textOutline; ctx.lineWidth = Math.max(2, size * 0.14, 3 / (k > 0 ? k : 1));
+    ctx.strokeText(str, x, y);
+  }
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+
+function _uiRoundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.lineTo(x + w - r, y); g.arcTo(x + w, y, x + w, y + r, r);
+  g.lineTo(x + w, y + h - r); g.arcTo(x + w, y + h, x + w - r, y + h, r);
+  g.lineTo(x + r, y + h); g.arcTo(x, y + h, x, y + h - r, r);
+  g.lineTo(x, y + r); g.arcTo(x, y, x + r, y, r);
+  g.closePath();
+}
+
+/* ネオン枠（角丸・暗い中塗り）。矩形 (b.x, b.y, b.w, b.h) の内側に収まるように描く */
+function _uiFrameSprite(key, w, h, color, fill, r) {
+  return _neonSprite('uiFrame|' + key + '|' + w + 'x' + h, w, h, 8, function (g, S) {
+    var lw = 2;
+    _neonStroke(g, S, function () { _uiRoundRect(g, -w / 2 + lw / 2, -h / 2 + lw / 2, w - lw, h - lw, r); }, color, lw,
+      { fill: fill, blur: 4, glowAlpha: 0.45, core: false });
+  });
+}
+function _uiFrame(ctx, b, key, color, fill, r) {
+  _neonBlit(ctx, _uiFrameSprite(key, b.w, b.h, color, fill, r), b.x + b.w / 2, b.y + b.h / 2);
+}
+
+/* ライフのアイコン：自機と見間違えないよう、形（ハート）・色（淡い緑）・大きさ（12px、自機は24px）を変える（仕様 v1.3 4.2）
+ * 塗りつぶし＋暗い縁取りで、星や敵の上でも輪郭が切れる。光（グロー）は付けない。並ぶ位置は lifeIconSize(14)+lifeIconGap(6) のまま */
+function _uiLifeSprite() {
+  var N = UI_NEON, s = N.lifeSize;
+  return _neonSprite('uiLife|' + s, s, s, 3, function (g, S) {
+    function heart() {
+      var w = s / 2, h = s / 2;
+      g.beginPath();
+      g.moveTo(0, h * 0.85);
+      g.bezierCurveTo(-w * 0.2, h * 0.55, -w, h * 0.15, -w, -h * 0.3);
+      g.bezierCurveTo(-w, -h * 0.85, -w * 0.25, -h * 1.0, 0, -h * 0.45);
+      g.bezierCurveTo(w * 0.25, -h * 1.0, w, -h * 0.85, w, -h * 0.3);
+      g.bezierCurveTo(w, h * 0.15, w * 0.2, h * 0.55, 0, h * 0.85);
+      g.closePath();
+    }
+    g.lineJoin = 'round';
+    g.strokeStyle = N.lifeOutline; g.lineWidth = 2.5; heart(); g.stroke();   // 暗い縁取り（外側に約1.25px）
+    g.fillStyle = N.lifeColor; heart(); g.fill();
+    g.fillStyle = 'rgba(255,255,255,0.55)';                                  // 小さなハイライト
+    g.beginPath(); g.arc(-s * 0.22, -s * 0.17, s * 0.1, 0, Math.PI * 2); g.fill();
+  });
+}
+
+function _uiOverlay(ctx, alpha) {
+  var S = CONFIG.screen;
+  ctx.fillStyle = 'rgba(' + UI_NEON.overlay + ',' + alpha + ')';
+  ctx.fillRect(0, 0, S.width, S.height);
+}
+
+/* 自機の見た目の箱（player.width×height）が、ライフの並ぶ範囲を margin px 広げた範囲に重なっているか（状態を持たない判定）。
+ * state.player が無い・やられ中（dead）・ライフ0 なら重なっていない扱い */
+function _uiPlayerNearLives(state, margin) {
+  var U = CONFIG.ui, S = CONFIG.screen, P = CONFIG.player, p = state && state.player;
+  if (!p || p.dead || !(state.lives > 0)) return false;
+  var m = margin != null ? margin : (U.lifeIconFadeMargin || 0);
+  var x0 = U.hudMargin - m, x1 = U.hudMargin + state.lives * U.lifeIconSize + (state.lives - 1) * U.lifeIconGap + m;
+  var y0 = S.height - U.hudMargin - U.lifeIconSize - m, y1 = S.height - U.hudMargin + m;
+  return p.x + P.width / 2 > x0 && p.x - P.width / 2 < x1 && p.y + P.height / 2 > y0 && p.y - P.height / 2 < y1;
+}
+/* ライフを薄くするかの状態（ヒステリシス付き）。境目の上で自機が小刻みに動いてもチラつかないように、
+ * 「近い」に入るのは lifeIconFadeMargin 以内、「近い」から出るのは lifeIconFadeExitMargin より外に出たとき。
+ * 自機なし・やられ中・ライフ0（タイトル、ゲームオーバー、被弾の爆発中）は必ず「遠い」に戻す → リトライ時も不透明から始まる */
+var _uiLifeFade = { a: 1, t: null, near: false };
+function _uiLifeNearUpdate(state) {
+  var U = CONFIG.ui, f = _uiLifeFade, p = state && state.player;
+  if (!p || p.dead || !(state.lives > 0)) { f.near = false; return false; }
+  var enterM = U.lifeIconFadeMargin || 0;
+  var exitM = U.lifeIconFadeExitMargin != null ? Math.max(enterM, U.lifeIconFadeExitMargin) : enterM;
+  f.near = _uiPlayerNearLives(state, f.near ? exitM : enterM);
+  return f.near;
+}
+/* ライフの不透明度。lifeIconFadeTime 秒かけて目標値へ近づける（時計は drawBackground の t。一時停止中は止まる）。
+ * 時間が戻った・飛んだ（タブ復帰など）ときはすぐ目標値にする */
+function _uiLifeAlpha(state) {
+  var U = CONFIG.ui;
+  var fadeA = U.lifeIconFadeAlpha != null ? U.lifeIconFadeAlpha : 0.4;
+  var fadeT = U.lifeIconFadeTime > 0 ? U.lifeIconFadeTime : 0;
+  var target = _uiLifeNearUpdate(state) ? fadeA : 1;
+  var f = _uiLifeFade, dt = f.t === null ? -1 : _neonTime - f.t;
+  f.t = _neonTime;
+  if (dt < 0 || dt > 0.5 || fadeT === 0) f.a = target;
+  else {
+    var step = dt * (1 - fadeA) / fadeT;
+    f.a = f.a < target ? Math.min(target, f.a + step) : Math.max(target, f.a - step);
+  }
+  return f.a;
+}
+
 function drawHUD(ctx, state) {
-  var U = CONFIG.ui, S = CONFIG.screen, P = CONFIG.player;
+  var U = CONFIG.ui, S = CONFIG.screen, N = UI_NEON;
   ctx.save();
-  _text(ctx, String(state.score), U.hudMargin, U.hudMargin + U.hudFontSize / 2, U.hudFontSize, '#fff', 'left');
-  _text(ctx, 'HI ' + Math.max(state.hiScore, state.score), S.width / 2, U.hudMargin + U.hudFontSize / 2, U.hudFontSize, '#ccc', 'center');
-  // ライフ（左下）
-  ctx.fillStyle = P.color;
+  _uiText(ctx, String(state.score), U.hudMargin, U.hudMargin + U.hudFontSize / 2, U.hudFontSize, '#fff', 'left');
+  _uiText(ctx, 'HI ' + Math.max(state.hiScore, state.score), S.width / 2, U.hudMargin + U.hudFontSize / 2, U.hudFontSize, N.hi, 'center');
+  // ライフ（左下）：淡い緑のハート。並ぶ位置は v1.1 と同じ。自機が近い・重なるときは薄くする
+  var life = _uiLifeSprite();
+  ctx.globalAlpha = _uiLifeAlpha(state);
   for (var i = 0; i < state.lives; i++) {
     var cx = U.hudMargin + U.lifeIconSize / 2 + i * (U.lifeIconSize + U.lifeIconGap);
     var cy = S.height - U.hudMargin - U.lifeIconSize / 2;
-    ctx.beginPath();
-    ctx.moveTo(cx, cy - U.lifeIconSize / 2);
-    ctx.lineTo(cx + U.lifeIconSize / 2, cy + U.lifeIconSize / 2);
-    ctx.lineTo(cx - U.lifeIconSize / 2, cy + U.lifeIconSize / 2);
-    ctx.closePath(); ctx.fill();
+    _neonBlit(ctx, life, cx, cy);
   }
-  // 一時停止ボタン（右上）
+  ctx.globalAlpha = 1;
+  // 一時停止ボタン（右上）：見た目は pauseButton の矩形内。判定は game.js 側（変更なし）
   var pb = U.pauseButton;
-  ctx.strokeStyle = 'rgba(255,255,255,0.7)';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(pb.x, pb.y, pb.w, pb.h);
-  ctx.fillStyle = 'rgba(255,255,255,0.8)';
+  _uiFrame(ctx, pb, 'pause', '#8cf', 'rgba(4,10,24,0.55)', 6);
+  ctx.fillStyle = 'rgba(225,245,255,0.92)';
   ctx.fillRect(pb.x + pb.w * 0.3, pb.y + pb.h * 0.25, pb.w * 0.13, pb.h * 0.5);
   ctx.fillRect(pb.x + pb.w * 0.57, pb.y + pb.h * 0.25, pb.w * 0.13, pb.h * 0.5);
-  // ボスHPバー
+  // ボスHPバー：琥珀色の中身＋マゼンタの細い外枠（敵弾のピンクは使わない）
   if (state.boss && state.boss.active) {
-    var bb = U.bossBar;
-    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    var bb = U.bossBar, k = Math.max(0, Math.min(1, state.boss.hp / state.boss.maxHp));
+    ctx.fillStyle = 'rgba(30,12,4,0.85)';
     ctx.fillRect(bb.x, bb.y, bb.w, bb.h);
-    ctx.fillStyle = CONFIG.boss.color;
-    ctx.fillRect(bb.x, bb.y, bb.w * Math.max(0, state.boss.hp) / state.boss.maxHp, bb.h);
+    var gr = ctx.createLinearGradient(0, bb.y, 0, bb.y + bb.h);
+    gr.addColorStop(0, N.bossFillHi); gr.addColorStop(1, N.bossFill);
+    ctx.fillStyle = gr;
+    ctx.fillRect(bb.x, bb.y, bb.w * k, bb.h);
+    ctx.strokeStyle = N.bossFrame; ctx.lineWidth = 1;
+    ctx.strokeRect(bb.x - 1.5, bb.y - 1.5, bb.w + 3, bb.h + 3);
   }
-  if (state.muted) _text(ctx, 'MUTE', S.width - U.hudMargin, S.height - U.hudMargin - U.smallFontSize / 2, U.smallFontSize, '#888', 'right');
+  if (state.muted) _uiText(ctx, 'MUTE', S.width - U.hudMargin, S.height - U.hudMargin - U.smallFontSize / 2, U.smallFontSize, N.dim, 'right');
   ctx.restore();
 }
 
 function drawTitle(ctx, state) {
-  var U = CONFIG.ui, S = CONFIG.screen;
+  var U = CONFIG.ui, S = CONFIG.screen, N = UI_NEON;
   ctx.save();
-  _text(ctx, 'STAR DASH', S.width / 2, S.height * 0.3, U.titleFontSize, '#4ff');
-  _text(ctx, 'HI ' + state.hiScore, S.width / 2, S.height * 0.42, U.textFontSize, '#fff');
+  _uiText(ctx, 'STAR DASH', S.width / 2, S.height * 0.3, U.titleFontSize, N.cyan, 'center', 10);
+  // タイトル下の細いライン（固定の絵なのでキャッシュ）
+  ctx.font = 'bold ' + U.titleFontSize + 'px ' + U.font;
+  var lineW = Math.round(Math.min(S.width - 60, ctx.measureText('STAR DASH').width));
+  _neonBlit(ctx, _neonSprite('uiTitleLine|' + lineW, lineW, 4, 6, function (g, Sc) {
+    _neonStroke(g, Sc, function () { g.beginPath(); g.moveTo(-lineW / 2, 0); g.lineTo(lineW / 2, 0); }, CONFIG.boss.color, 1.5, { blur: 4, glowAlpha: 0.5, core: false });
+  }), S.width / 2, S.height * 0.3 + U.titleFontSize * 0.68);
+  _uiText(ctx, 'HI ' + state.hiScore, S.width / 2, S.height * 0.42, U.textFontSize, '#fff');
   if ((state.titleTime % U.titleBlinkPeriod) < U.titleBlinkPeriod / 2) {
-    _text(ctx, 'PRESS SPACE / TAP TO START', S.width / 2, S.height * 0.6, U.textFontSize, '#ff4');
+    _uiText(ctx, 'PRESS SPACE / TAP TO START', S.width / 2, S.height * 0.6, U.textFontSize, N.gold, 'center', 5);
   }
-  _text(ctx, '移動: 矢印/WASD・ドラッグ', S.width / 2, S.height * 0.75, U.smallFontSize, '#ccc');
-  _text(ctx, '射撃: SPACE（スマホは自動）', S.width / 2, S.height * 0.75 + U.lineHeight * 0.7, U.smallFontSize, '#ccc');
-  _text(ctx, '一時停止: P　ミュート: M', S.width / 2, S.height * 0.75 + U.lineHeight * 1.4, U.smallFontSize, '#ccc');
-  if (state.muted) _text(ctx, 'MUTE', S.width - U.hudMargin, S.height - U.hudMargin, U.smallFontSize, '#888', 'right');
+  _uiText(ctx, '移動: 矢印/WASD・ドラッグ', S.width / 2, S.height * 0.75, U.smallFontSize, N.sub);
+  _uiText(ctx, '射撃: SPACE（スマホは自動）', S.width / 2, S.height * 0.75 + U.lineHeight * 0.7, U.smallFontSize, N.sub);
+  _uiText(ctx, '一時停止: P　ミュート: M', S.width / 2, S.height * 0.75 + U.lineHeight * 1.4, U.smallFontSize, N.sub);
+  if (state.muted) _uiText(ctx, 'MUTE', S.width - U.hudMargin, S.height - U.hudMargin, U.smallFontSize, N.dim, 'right');
   ctx.restore();
 }
 
 function drawPause(ctx, state) {
   var U = CONFIG.ui, S = CONFIG.screen;
   ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,' + U.pauseOverlayAlpha + ')';
-  ctx.fillRect(0, 0, S.width, S.height);
-  _text(ctx, 'PAUSED', S.width / 2, S.height * 0.45, U.bannerFontSize, '#fff');
-  _text(ctx, 'P / TAP TO RESUME', S.width / 2, S.height * 0.55, U.textFontSize, '#ccc');
+  _uiOverlay(ctx, U.pauseOverlayAlpha);
+  // 文字の後ろにネオン枠のパネル（2行の文字を囲む。文字の位置は v1.1 と同じ）
+  var top = S.height * 0.45 - U.bannerFontSize, bottom = S.height * 0.55 + U.textFontSize * 1.4;
+  _uiFrame(ctx, { x: 40, y: Math.round(top), w: S.width - 80, h: Math.round(bottom - top) }, 'pausePanel', '#8cf', 'rgba(4,10,24,0.6)', 10);
+  _uiText(ctx, 'PAUSED', S.width / 2, S.height * 0.45, U.bannerFontSize, '#fff', 'center', 8);
+  _uiText(ctx, 'P / TAP TO RESUME', S.width / 2, S.height * 0.55, U.textFontSize, UI_NEON.sub);
   ctx.restore();
 }
 
 function _resultCommon(ctx, state, y) {
-  var U = CONFIG.ui, S = CONFIG.screen;
-  if (state.newRecord) _text(ctx, 'NEW RECORD!', S.width / 2, y, U.textFontSize, '#ff4');
+  var U = CONFIG.ui, S = CONFIG.screen, N = UI_NEON;
+  if (state.newRecord) _uiText(ctx, 'NEW RECORD!', S.width / 2, y, U.textFontSize, N.gold, 'center', 6);
   if (state.resultTime >= U.resultInputLock) {
-    _text(ctx, 'SPACE / TAP: RETRY', S.width / 2, y + U.lineHeight * 1.5, U.textFontSize, '#fff');
-    _text(ctx, 'ESC: TITLE', S.width / 2, y + U.lineHeight * 2.5, U.textFontSize, '#ccc');
+    _uiText(ctx, 'SPACE / TAP: RETRY', S.width / 2, y + U.lineHeight * 1.5, U.textFontSize, '#fff');
+    _uiText(ctx, 'ESC: TITLE', S.width / 2, y + U.lineHeight * 2.5, U.textFontSize, N.sub);
     drawTitleButtonShape(ctx, U.titleButton);
   }
 }
@@ -480,45 +640,42 @@ function _resultCommon(ctx, state, y) {
 function drawTitleButtonShape(ctx, b) {
   var U = CONFIG.ui;
   ctx.save();
-  ctx.fillStyle = 'rgba(255,255,255,0.12)';
-  ctx.fillRect(b.x, b.y, b.w, b.h);
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = 2;
-  ctx.strokeRect(b.x, b.y, b.w, b.h);
-  _text(ctx, 'TITLE', b.x + b.w / 2, b.y + b.h / 2, U.textFontSize, '#fff');
+  _uiFrame(ctx, b, 'titleBtn', UI_NEON.cyan, 'rgba(10,40,60,0.7)', 8);
+  _uiText(ctx, 'TITLE', b.x + b.w / 2, b.y + b.h / 2, U.textFontSize, '#fff');
   ctx.restore();
 }
 
 function drawGameOver(ctx, state) {
-  var U = CONFIG.ui, S = CONFIG.screen;
+  var U = CONFIG.ui, S = CONFIG.screen, N = UI_NEON;
   ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,' + U.resultOverlayAlpha + ')';
-  ctx.fillRect(0, 0, S.width, S.height);
-  _text(ctx, 'GAME OVER', S.width / 2, S.height * 0.3, U.bannerFontSize, '#f55');
-  _text(ctx, 'SCORE ' + state.score, S.width / 2, S.height * 0.42, U.textFontSize, '#fff');
-  _text(ctx, 'HI ' + state.hiScore, S.width / 2, S.height * 0.42 + U.lineHeight, U.textFontSize, '#ccc');
+  _uiOverlay(ctx, U.resultOverlayAlpha);
+  _uiText(ctx, 'GAME OVER', S.width / 2, S.height * 0.3, U.bannerFontSize, N.red, 'center', 8);
+  _uiText(ctx, 'SCORE ' + state.score, S.width / 2, S.height * 0.42, U.textFontSize, '#fff');
+  _uiText(ctx, 'HI ' + state.hiScore, S.width / 2, S.height * 0.42 + U.lineHeight, U.textFontSize, N.hi);
   _resultCommon(ctx, state, S.height * 0.42 + U.lineHeight * 2.5);
   ctx.restore();
 }
 
 function _row(ctx, label, value, y, color) {
   var U = CONFIG.ui, S = CONFIG.screen, m = U.resultSideMargin;
-  _text(ctx, label, m, y, U.textFontSize, color, 'left');
-  _text(ctx, value, S.width - m, y, U.textFontSize, color, 'right');
+  _uiText(ctx, label, m, y, U.textFontSize, color, 'left');
+  _uiText(ctx, value, S.width - m, y, U.textFontSize, color, 'right');
 }
 
 function drawClear(ctx, state) {
-  var U = CONFIG.ui, S = CONFIG.screen, r = state.result;
+  var U = CONFIG.ui, S = CONFIG.screen, r = state.result, N = UI_NEON;
   ctx.save();
-  ctx.fillStyle = 'rgba(0,0,0,' + U.resultOverlayAlpha + ')';
-  ctx.fillRect(0, 0, S.width, S.height);
-  _text(ctx, 'STAGE CLEAR', S.width / 2, S.height * 0.2, U.bannerFontSize, '#4ff');
+  _uiOverlay(ctx, U.resultOverlayAlpha);
+  _uiText(ctx, 'STAGE CLEAR', S.width / 2, S.height * 0.2, U.bannerFontSize, N.cyan, 'center', 8);
   var y = S.height * 0.31, L = U.lineHeight;
   _row(ctx, 'プレイスコア（撃破＋星）', String(r.baseScore), y, '#fff');
   _row(ctx, 'ライフボーナス ×' + r.lives, '+' + r.lifeBonus, y + L, '#fff');
-  _row(ctx, 'ノーミスボーナス', '+' + r.noMissBonus, y + L * 2, r.noMissBonus > 0 ? '#ff4' : '#888');
-  _row(ctx, '合計', String(r.total), y + L * 3.2, '#4ff');
-  _text(ctx, 'HI ' + state.hiScore, S.width / 2, y + L * 4.4, U.textFontSize, '#ccc');
+  _row(ctx, 'ノーミスボーナス', '+' + r.noMissBonus, y + L * 2, r.noMissBonus > 0 ? N.gold : N.dim);
+  // 合計の上の区切り線（ボーナス行と合計行のあいだ）
+  ctx.strokeStyle = 'rgba(120,230,255,0.45)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(U.resultSideMargin, y + L * 2.6); ctx.lineTo(S.width - U.resultSideMargin, y + L * 2.6); ctx.stroke();
+  _row(ctx, '合計', String(r.total), y + L * 3.2, N.cyan);
+  _uiText(ctx, 'HI ' + state.hiScore, S.width / 2, y + L * 4.4, U.textFontSize, N.hi);
   _resultCommon(ctx, state, y + L * 5.4);
   ctx.restore();
 }
