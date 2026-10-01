@@ -226,6 +226,10 @@ var CONFIG = {
       duckAttack: 0.01,       // 下げるまでの秒数
       duckRelease: 0.15,      // 戻すまでの秒数
       limitThreshold: -3,     // リミッターのしきい値（dB）。ふだんは効かない高さ
+      limitKnee: 0,           // リミッターのニー（dB）
+      limitRatio: 20,         // リミッターの比
+      limitAttack: 0.001,     // リミッターのアタック（秒）
+      limitRelease: 0.1,      // リミッターのリリース（秒）。この4つと limitThreshold がそろっていないとリミッターは入らない
       outputTrim: 0.92,       // リミッターのあとの倍率（True Peak を -1dBTP 以下に保つ）
       maxSfxVoices: 24        // 効果音全体の同時発音数。超えたら se_shot / se_hit から間引く
     },

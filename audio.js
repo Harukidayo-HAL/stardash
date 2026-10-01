@@ -44,14 +44,14 @@ var Sound = (function () {
   var loop = null;         // 再生中のBGMの状態 { def, bus, send, nextTime }
   var sfxOut = null;       // 効果音バスの出力先（リミッター、なければ master）
   var minorBus = null;     // 連打される細かい音（se_shot / se_hit / se_explode）。大事な音の間だけ下げる
-  // 音量の配分（実測で決めた値。CONFIG.audio.mix があればそちらを使う）
-  function mix(k, d) { var c = cfg(); return num(c && c.mix && c.mix[k], d); }
+  // 音量の配分・間引きの数値は config.js（CONFIG.audio.mix / CONFIG.audio.sfx）だけに置く。ここには数値を書かない。
+  // 値が無いときは undefined を返し、呼ぶ側で「掛けない／その処理をしない」にする（例外は出さない）
+  function mix(k) { var c = cfg(); return num(c && c.mix && c.mix[k], undefined); }
+  function has() { for (var i = 0; i < arguments.length; i++) if (arguments[i] === undefined) return false; return true; }
   var LOOKAHEAD = 0.14;    // 秒。BGM は少し先まで予約してタイマーの揺れに強くする
   var TICK_MS = 25;
   var MINOR_IDS = { se_shot: 1, se_hit: 1, se_explode: 1 };
-  // 調整する数値の正本は config.js の CONFIG.audio.mix と CONFIG.audio.sfx。ここの値は config に無いときの予備だけ
-  var KEY_DUCK = { se_damage: 0.55, se_star: 0.35, se_warning: 1.5 };   // 予備: 大事な音が鳴る間、細かい音を下げておく秒数
-  function sfxCfg(id) { var c = cfg(); return (c && c.sfx && c.sfx[id]) || {}; }
+  function sfxCfg(id) { var c = cfg(); return (c && c.sfx && c.sfx[id]) || null; }   // 無い音は鳴らさない
   var sfxLevel = 1;        // いま鳴らしている効果音の音量倍率（CONFIG.audio.sfx[id].level）。BGM では 1
 
   function cfg() { return (typeof CONFIG !== 'undefined' && CONFIG.audio) ? CONFIG.audio : null; }
@@ -76,18 +76,22 @@ var Sound = (function () {
     var c = cfg();
     var out = master;
     try {
-      // 安全用のリミッター。ふだんはかからず、ボス撃破などの大きな音が重なったときだけ効く高さにする
-      var lim = ctx.createDynamicsCompressor();
-      lim.threshold.value = mix('limitThreshold', -3); lim.knee.value = 0; lim.ratio.value = 20;
-      lim.attack.value = 0.001; lim.release.value = 0.1;
-      var trim = ctx.createGain(); trim.gain.value = mix('outputTrim', 0.92);   // compressor の自動メイクアップ分を戻して True Peak を -1dBTP 未満に
-      lim.connect(trim); trim.connect(master);
-      out = lim;
+      // 安全用のリミッター。ふだんはかからず、ボス撃破などの大きな音が重なったときだけ効く高さにする（値は CONFIG.audio.mix）
+      // 値が1つでも無ければリミッターは入れない（ブラウザの既定値で強く圧縮されるのを避ける）
+      var th = mix('limitThreshold'), kn = mix('limitKnee'), ra = mix('limitRatio'), at = mix('limitAttack'), re = mix('limitRelease');
+      if (has(th, kn, ra, at, re)) {
+        var lim = ctx.createDynamicsCompressor();
+        lim.threshold.value = th; lim.knee.value = kn; lim.ratio.value = ra;
+        lim.attack.value = at; lim.release.value = re;
+        var trim = ctx.createGain(); trim.gain.value = num(mix('outputTrim'), 1);   // compressor の自動メイクアップ分を戻して True Peak を -1dBTP 未満に（無ければ掛けない）
+        lim.connect(trim); trim.connect(master);
+        out = lim;
+      }
     } catch (e) { out = master; }
     sfxOut = out;
     makeSfxBuses();
     try {
-      bgmBus = ctx.createGain(); bgmBus.gain.value = num(c && c.bgmVolume, 0.5) * mix('bgm', 1.45); bgmBus.connect(out);
+      bgmBus = ctx.createGain(); bgmBus.gain.value = num(c && c.bgmVolume, 1) * num(mix('bgm'), 1); bgmBus.connect(out);   // 値が無ければ掛けない
     } catch (e) { bgmBus = null; }
   }
 
@@ -95,7 +99,7 @@ var Sound = (function () {
   function makeSfxBuses() {
     var c = cfg(), out = sfxOut || master;
     try {
-      sfxBus = ctx.createGain(); sfxBus.gain.value = num(c && c.seVolume, 0.7) * mix('sfx', 1.0); sfxBus.connect(out);
+      sfxBus = ctx.createGain(); sfxBus.gain.value = num(c && c.seVolume, 1) * num(mix('sfx'), 1); sfxBus.connect(out);   // 値が無ければ掛けない
     } catch (e) { sfxBus = null; }
     try {
       minorBus = ctx.createGain(); minorBus.gain.value = 1; minorBus.connect(sfxBus || out);
@@ -190,28 +194,28 @@ var Sound = (function () {
   function rnd(a, b) { return a + Math.random() * (b - a); }
 
   // ---- 効果音の定義 ----
-  // gap: 同じIDの最短間隔(秒)、max: 同じIDの同時発音数、len: おおよその長さ（発音数の管理用）
-  // gap と max は CONFIG.audio.sfx[id] にあればそちらを使う（ここの値は予備）。len は音の長さに合わせた内部の値
+  // len: おおよその長さ（発音数の管理用。音の長さに合わせた内部の値）
+  // 音量の倍率・最短間隔・同時発音数・ダッキングは CONFIG.audio.sfx[id]（level, gap, max, duck）にだけ書く
   var SFX = {
     // 射撃: とても短く静かな「ポッ」。三角波中心で高い倍音を抑え、2〜6kHz が耳に刺さらないように。毎回わずかに音程を揺らす
-    se_shot: { gap: 0.05, max: 3, len: 0.06, fn: function (t, d) {
+    se_shot: { len: 0.06, fn: function (t, d) {
       var p = rnd(0.97, 1.03);
       voice({ type: 'triangle', f: 1250 * p, f1: 640 * p, t: t, dur: 0.05, gain: 0.14, a: 0.002, dest: d });
       voice({ type: 'square', f: 1250 * p, f1: 640 * p, t: t, dur: 0.035, gain: 0.024, a: 0.002, lp: 1800, dest: d });
     } },
     // 命中: 乾いた「チッ」。高域（6kHz〜）のノイズで、大事な音の帯域（1〜4kHz）をふさがない
-    se_hit: { gap: 0.06, max: 2, len: 0.05, fn: function (t, d) {
+    se_hit: { len: 0.05, fn: function (t, d) {
       noise({ t: t, dur: 0.03, gain: 0.112, ftype: 'highpass', f: 6500, dest: d });
       voice({ type: 'triangle', f: 900, f1: 500, t: t, dur: 0.04, gain: 0.064, dest: d });
     } },
     // 敵撃破: こもったノイズの「ボフッ」＋低いドスン（中高域は控えめ）
-    se_explode: { gap: 0.07, max: 3, len: 0.4, fn: function (t, d) {
+    se_explode: { len: 0.4, fn: function (t, d) {
       noise({ t: t, dur: 0.36, gain: 0.16, ftype: 'lowpass', f: 1800, f1: 150, q: 1.0, dest: d });
       voice({ type: 'sine', f: 180, f1: 42, t: t, dur: 0.28, gain: 0.32, a: 0.002, dest: d });
       voice({ type: 'square', f: 260, f1: 60, t: t, dur: 0.1, gain: 0.025, lp: 700, dest: d });
     } },
     // 星: キラッと上がる3音（E6→A6→E7）＋短い余韻。1〜4kHz にしっかり音がある
-    se_star: { gap: 0.04, max: 3, len: 0.36, fn: function (t, d) {
+    se_star: { len: 0.36, fn: function (t, d) {
       var n = [88, 93, 100];
       for (var i = 0; i < 3; i++) {
         var last = (i === 2);
@@ -220,7 +224,7 @@ var Sound = (function () {
       }
     } },
     // 被弾: ザラついた下降音＋1〜4kHz の濁ったブザー＋ノイズ。爆発や命中が重なっていても「やられた」とわかる
-    se_damage: { gap: 0.15, max: 1, len: 0.6, fn: function (t, d) {
+    se_damage: { len: 0.6, fn: function (t, d) {
       voice({ type: 'sawtooth', f: 620, f1: 90, t: t, dur: 0.5, gain: 0.24, lp: 3500, lp1: 900, q: 4, dest: d });
       voice({ type: 'square', f: 1480, f1: 880, t: t, dur: 0.48, gain: 0.07, hold: 0.2, lp: 4000, dest: d });
       voice({ type: 'square', f: 1520, f1: 905, t: t, dur: 0.48, gain: 0.07, hold: 0.2, lp: 4000, dest: d });
@@ -228,7 +232,7 @@ var Sound = (function () {
       voice({ type: 'sine', f: 140, f1: 40, t: t, dur: 0.35, gain: 0.3, dest: d });
     } },
     // WARNING: うねる警報音を3回
-    se_warning: { gap: 0.5, max: 1, len: 1.5, fn: function (t, d) {
+    se_warning: { len: 1.5, fn: function (t, d) {
       for (var i = 0; i < 3; i++) {
         var s = t + i * 0.5;
         voice({ type: 'sawtooth', f: 520, f1: 820, glide: 0.3, t: s, dur: 0.4, gain: 0.2, a: 0.02, hold: 0.22, lp: 2600, q: 3, dest: d });
@@ -237,7 +241,7 @@ var Sound = (function () {
       }
     } },
     // ボス撃破: 連続する爆発＋長い低音と余韻
-    se_boss_explode: { gap: 0.5, max: 1, len: 2.6, fn: function (t, d) {
+    se_boss_explode: { len: 2.6, fn: function (t, d) {
       voice({ type: 'sine', f: 120, f1: 28, t: t, dur: 2.0, gain: 0.55, a: 0.005, dest: d });
       voice({ type: 'sawtooth', f: 90, f1: 30, t: t, dur: 1.4, gain: 0.12, lp: 600, lp1: 80, dest: d });
       noise({ t: t, dur: 2.4, gain: 0.4, ftype: 'lowpass', f: 3000, f1: 90, q: 0.8, dest: d });
@@ -251,7 +255,7 @@ var Sound = (function () {
       voice({ type: 'triangle', f: mtof(88), t: t + 1.08, dur: 1.3, gain: 0.04, a: 0.05, dest: d });
     } },
     // ゲームオーバー: 下がっていく短調のアルペジオ（E5 C5 A4 → 低いA）
-    se_gameover: { gap: 0.5, max: 1, len: 2.0, fn: function (t, d) {
+    se_gameover: { len: 2.0, fn: function (t, d) {
       var n = [76, 72, 69, 64];
       for (var i = 0; i < n.length; i++) {
         var s = t + i * 0.22, last = (i === n.length - 1), dur = last ? 1.4 : 0.32;
@@ -261,7 +265,7 @@ var Sound = (function () {
       voice({ type: 'triangle', f: mtof(45), f1: mtof(45) * 0.94, t: t + 0.66, dur: 1.4, gain: 0.3, a: 0.02, dest: d });
     } },
     // クリア: 上がっていく長調のファンファーレ（A C# E A → A の和音）
-    se_clear: { gap: 0.5, max: 1, len: 2.0, fn: function (t, d) {
+    se_clear: { len: 2.0, fn: function (t, d) {
       var n = [69, 73, 76, 81];
       for (var i = 0; i < n.length; i++) {
         voice({ type: 'square', f: mtof(n[i]), t: t + i * 0.11, dur: 0.18, gain: 0.08, lp: 3200, dest: d });
@@ -275,7 +279,7 @@ var Sound = (function () {
       voice({ type: 'sine', f: mtof(93), t: s + 0.1, dur: 1.0, gain: 0.04, a: 0.02, dest: d });
     } },
     // 決定: 短い2音の「ピロッ」（A5→E6）
-    se_select: { gap: 0.04, max: 2, len: 0.16, fn: function (t, d) {
+    se_select: { len: 0.16, fn: function (t, d) {
       voice({ type: 'square', f: mtof(81), t: t, dur: 0.06, gain: 0.144, lp: 3500, dest: d });
       voice({ type: 'square', f: mtof(88), t: t + 0.05, dur: 0.1, gain: 0.144, lp: 3500, dest: d });
     } }
@@ -296,18 +300,21 @@ var Sound = (function () {
   function duckMinor(now, dur) {
     if (!minorBus) return;
     try {
-      var g = minorBus.gain, low = mix('duck', 0.4);
+      var g = minorBus.gain, low = mix('duck'), atk = mix('duckAttack'), rel = mix('duckRelease');
+      if (!has(low, atk, rel)) return;   // 値が無ければ下げない
       g.cancelScheduledValues(now);
       g.setValueAtTime(g.value, now);
-      g.linearRampToValueAtTime(low, now + mix('duckAttack', 0.01));
+      g.linearRampToValueAtTime(low, now + atk);
       g.setValueAtTime(low, now + dur);
-      g.linearRampToValueAtTime(1, now + dur + mix('duckRelease', 0.15));
+      g.linearRampToValueAtTime(1, now + dur + rel);
     } catch (e) { /* 無視 */ }
   }
 
   function playSfx(id) {
     var def = SFX[id];
     if (!def) return;
+    // 画面が隠れている間は鳴らさないし覚えもしない（隠した瞬間の一時停止音も含む。QA 20:30）
+    if (typeof document !== 'undefined' && document.hidden) return;
     if (!canSound()) {
       // 解除済みで準備（resume）待ちのときだけ、最後の1つを短い間だけ覚えておく。まとめて鳴らすことはしない
       // 射撃音・命中音は細かく何度も鳴るので覚えない（開始音などの大事な音を上書きしないため。QA 再レビュー 18:5x）
@@ -317,13 +324,14 @@ var Sound = (function () {
       return;
     }
     var now = ctx.currentTime, sc = sfxCfg(id);
-    var gap = num(sc.gap, def.gap), max = num(sc.max, def.max), duck = num(sc.duck, KEY_DUCK[id] || 0);
+    if (!sc) return;   // CONFIG.audio.sfx に無い音は鳴らさない（調整値の無い音を勝手な音量で出さない）
+    var gap = num(sc.gap, 0), max = num(sc.max, Infinity), duck = num(sc.duck, 0);   // 無い値は「間引かない／下げない」
     if (lastPlay[id] !== undefined && now - lastPlay[id] < gap && now >= lastPlay[id]) return;   // 連打の間引き
     var list = voices[id] || (voices[id] = []);
     while (list.length && list[0] <= now) list.shift();
     while (allVoices.length && allVoices[0] <= now) allVoices.shift();
     if (list.length >= max) return;                                       // 同じ音の重なりすぎを防ぐ
-    if (allVoices.length >= mix('maxSfxVoices', 24) && (id === 'se_shot' || id === 'se_hit')) return;   // 混んでいるときは細かい音から間引く
+    if (allVoices.length >= num(mix('maxSfxVoices'), Infinity) && (id === 'se_shot' || id === 'se_hit')) return;   // 混んでいるときは細かい音から間引く
     lastPlay[id] = now;
     var end = now + def.len;
     list.push(end);
